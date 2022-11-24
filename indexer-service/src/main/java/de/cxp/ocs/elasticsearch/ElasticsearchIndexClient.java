@@ -1,22 +1,19 @@
 package de.cxp.ocs.elasticsearch;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
+import java.util.*;
 
 import org.elasticsearch.ElasticsearchException;
+import org.elasticsearch.ElasticsearchStatusException;
 import org.elasticsearch.action.DocWriteRequest.OpType;
+import org.elasticsearch.action.admin.cluster.health.ClusterHealthRequest;
+import org.elasticsearch.action.admin.cluster.health.ClusterHealthResponse;
 import org.elasticsearch.action.admin.indices.alias.IndicesAliasesRequest;
 import org.elasticsearch.action.admin.indices.alias.IndicesAliasesRequest.AliasActions;
 import org.elasticsearch.action.admin.indices.alias.get.GetAliasesRequest;
 import org.elasticsearch.action.admin.indices.delete.DeleteIndexRequest;
-import org.elasticsearch.action.admin.indices.forcemerge.ForceMergeRequest;
-import org.elasticsearch.action.admin.indices.forcemerge.ForceMergeResponse;
+import org.elasticsearch.action.admin.indices.refresh.RefreshRequest;
+import org.elasticsearch.action.admin.indices.refresh.RefreshResponse;
 import org.elasticsearch.action.admin.indices.settings.get.GetSettingsRequest;
 import org.elasticsearch.action.admin.indices.settings.get.GetSettingsResponse;
 import org.elasticsearch.action.admin.indices.settings.put.UpdateSettingsRequest;
@@ -37,8 +34,10 @@ import org.elasticsearch.client.RestHighLevelClient;
 import org.elasticsearch.client.core.CountRequest;
 import org.elasticsearch.client.core.CountResponse;
 import org.elasticsearch.client.indices.CreateIndexRequest;
+import org.elasticsearch.cluster.health.ClusterHealthStatus;
 import org.elasticsearch.cluster.metadata.AliasMetadata;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.rest.RestStatus;
 import org.elasticsearch.xcontent.XContentType;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
@@ -141,13 +140,12 @@ class ElasticsearchIndexClient {
 	public boolean finalizeIndex(String indexName, int numberOfReplicas, String refreshInterval) throws IOException {
 		boolean success = applyIndexSettings(indexName, numberOfReplicas, refreshInterval);
 
-		ForceMergeRequest forceMergeRequest = new ForceMergeRequest(indexName);
-		forceMergeRequest.flush(true);
-		ForceMergeResponse forceMergeResponse = highLevelClient.indices().forcemerge(forceMergeRequest, RequestOptions.DEFAULT);
+		// refresh immediately
+		RefreshResponse refresh = highLevelClient.indices().refresh(new RefreshRequest(indexName), RequestOptions.DEFAULT);
 
-		if (forceMergeResponse.getFailedShards() > 0) {
-			log.error("Failed to force-merge & flush complete index. {} out of {} shards failed.",
-					forceMergeResponse.getFailedShards(), forceMergeResponse.getTotalShards());
+		if (refresh.getFailedShards() > 0) {
+			log.error("Failed to refresh index. {} out of {} shards failed.",
+					refresh.getFailedShards(), refresh.getTotalShards());
 			return false;
 		}
 		return success;
@@ -174,6 +172,26 @@ class ElasticsearchIndexClient {
 					e.getClass().getSimpleName(), e.getMessage());
 		}
 		return false;
+	}
+
+	public ClusterHealthStatus waitUntilHealthy(String indexName, int timeoutMillis) {
+		long start = System.currentTimeMillis();
+		ClusterHealthResponse health = null;
+		do {
+			try {
+				health = highLevelClient.cluster().health(new ClusterHealthRequest(indexName), RequestOptions.DEFAULT);
+				Thread.sleep(50);
+			}
+			catch (IOException e) {
+				log.warn("Could not fetch health status for index {} because of {}", indexName, e.getMessage());
+			}
+			catch (InterruptedException e) {
+				log.info("Interrupted waiting for healthy index {}", indexName);
+				break;
+			}
+		}
+		while (!ClusterHealthStatus.GREEN.equals(health.getStatus()) && (System.currentTimeMillis() - start) < timeoutMillis);
+		return health == null ? ClusterHealthStatus.RED : health.getStatus();
 	}
 
 	/**
@@ -228,17 +246,17 @@ class ElasticsearchIndexClient {
 	 * Will apply all record inside one single bulk request. The target index
 	 * will be delete before if already present.
 	 * 
-	 * @param records
+	 * @param items
 	 * @return
 	 * @throws IOException
 	 */
-	public Optional<BulkResponse> indexRecords(String indexName, Iterator<IndexableItem> records) throws IOException {
+	public Optional<BulkResponse> indexRecords(String indexName, List<IndexableItem> items) throws IOException {
 		BulkRequest bulkIndexRequest = new BulkRequest();
 		int docCount = 0;
-		while (records.hasNext()) {
+		for (IndexableItem item : items) {
 			IndexRequest indexRequest;
 			try {
-				indexRequest = asIndexRequest(indexName, records.next());
+				indexRequest = asIndexRequest(indexName, item);
 				bulkIndexRequest.add(indexRequest);
 				docCount++;
 			}
@@ -246,7 +264,9 @@ class ElasticsearchIndexClient {
 				log.warn("failed to add record to bulk request", e);
 			}
 		}
-		if (docCount > 0) return Optional.ofNullable(highLevelClient.bulk(bulkIndexRequest, RequestOptions.DEFAULT));
+		if (docCount > 0) {
+			return Optional.ofNullable(highLevelClient.bulk(bulkIndexRequest, RequestOptions.DEFAULT));
+		}
 		else return Optional.empty();
 	}
 
@@ -333,7 +353,14 @@ class ElasticsearchIndexClient {
 
 		List<DeleteResponse> responses = new ArrayList<>();
 		for (BulkItemResponse item : bulkResponse.getItems()) {
-			responses.add((DeleteResponse) item.getResponse());
+			if (item.isFailed()) {
+				if (RestStatus.NOT_FOUND.equals(item.getFailure().getStatus())) {
+					throw new ElasticsearchStatusException(item.getFailureMessage(), item.getFailure().getStatus(),
+							item.getFailure().getCause());
+				}
+			} else {
+				responses.add((DeleteResponse) item.getResponse());
+			}
 		}
 		return responses;
 	}

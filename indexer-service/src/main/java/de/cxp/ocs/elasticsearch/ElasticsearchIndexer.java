@@ -26,6 +26,7 @@ import org.elasticsearch.action.get.GetRequest;
 import org.elasticsearch.action.get.GetResponse;
 import org.elasticsearch.client.RequestOptions;
 import org.elasticsearch.client.RestHighLevelClient;
+import org.elasticsearch.cluster.health.ClusterHealthStatus;
 import org.elasticsearch.cluster.metadata.AliasMetadata;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.rest.RestStatus;
@@ -192,9 +193,22 @@ public class ElasticsearchIndexer extends AbstractIndexer {
 		}
 		else {
 			log.info("Adding {} documents to index {}", bulk.size(), session.finalIndexName);
-			return indexClient.indexRecords(session.temporaryIndexName, bulk.iterator())
-					.map(this::getSuccessCount)
-					.orElse(0);
+			try {
+				return indexClient.indexRecords(session.temporaryIndexName, bulk)
+						.map(this::getSuccessCount)
+						.orElse(0);
+			}
+			catch (ElasticsearchStatusException ese) {
+				if (ese.getMessage().contains("Data too large")) {
+					log.warn("BulkSize seems to high for index request to {} with {} items. Bulk Indexation will be split in two parts...", session.finalIndexName, bulk.size());
+					return indexClient.indexRecordsChunkwise(session.temporaryIndexName, bulk.iterator(), bulk.size() / 2)
+							.stream()
+							.collect(Collectors.summingInt(this::getSuccessCount));
+				}
+				else {
+					throw ese;
+				}
+			}
 		}
 	}
 
@@ -250,6 +264,12 @@ public class ElasticsearchIndexer extends AbstractIndexer {
 		}
 
 		try {
+			ClusterHealthStatus indexHealth = indexClient.waitUntilHealthy(session.temporaryIndexName, indexSettings.waitTimeMsForHealthyIndex);
+			if (ClusterHealthStatus.RED.equals(indexHealth)) {
+				log.error("Index {} not healthy after {}ms! Won't deploy!", session.temporaryIndexName, indexSettings.waitTimeMsForHealthyIndex);
+				return false;
+			}
+
 			long docCount = indexClient.getDocCount(session.temporaryIndexName);
 			if (docCount < indexSettings.minimumDocumentCount) {
 				log.error("new index version {} for index {} has only {} documents indexed, which is not the required minimum document count of {}",

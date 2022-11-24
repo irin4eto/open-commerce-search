@@ -1,35 +1,16 @@
 package de.cxp.ocs.elasticsearch.query.analyzer;
 
-import java.io.BufferedInputStream;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
+import java.io.*;
 import java.net.URL;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
-import de.cxp.ocs.elasticsearch.query.model.QueryStringTerm;
-import de.cxp.ocs.elasticsearch.query.model.WeightedWord;
-import de.cxp.ocs.elasticsearch.query.model.WordAssociation;
+import de.cxp.ocs.elasticsearch.query.model.*;
 import de.cxp.ocs.spi.search.ConfigurableExtension;
 import de.cxp.ocs.spi.search.UserQueryAnalyzer;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-import querqy.model.AbstractNodeVisitor;
-import querqy.model.BooleanClause;
-import querqy.model.BooleanQuery;
-import querqy.model.BoostedTerm;
+import querqy.model.*;
 import querqy.model.Clause.Occur;
-import querqy.model.DisjunctionMaxQuery;
-import querqy.model.ExpandedQuery;
-import querqy.model.Node;
-import querqy.model.QuerqyQuery;
-import querqy.model.Term;
 import querqy.parser.QuerqyParser;
 import querqy.parser.WhiteSpaceQuerqyParser;
 import querqy.rewrite.RewriteChain;
@@ -118,14 +99,24 @@ public class QuerqyQueryExpander implements UserQueryAnalyzer, ConfigurableExten
 
 			for (BooleanClause clause : userQuery.getClauses()) {
 				clause.accept(termFetcher);
-				List<WeightedWord> fetchedWords = termFetcher.getWords();
+				List<QueryStringTerm> fetchedWords = termFetcher.getWords();
 				if (fetchedWords.isEmpty()) continue;
 
 				if (fetchedWords.size() == 1) {
 					terms.add(termFetcher.getWords().get(0));
 				}
 				else {
-					terms.add(new WordAssociation(fetchedWords.get(0).getWord(), new ArrayList<>(fetchedWords.subList(1, fetchedWords.size()))));
+					List<WeightedWord> convertedList = new ArrayList<>();
+					for (int index = 1; index < fetchedWords.size(); index++){
+						QueryStringTerm fetchedWord = fetchedWords.get(index);
+						if (fetchedWord instanceof WeightedWord) {
+							convertedList.add((WeightedWord) fetchedWords.get(index));
+						} else {
+							log.warn("Found wrong QueryStringTerm entry, cannot add it to the list: " + fetchedWord.toString());
+						}
+					}
+
+					terms.add(new WordAssociation(fetchedWords.get(0).getWord(), convertedList));
 				}
 				termFetcher.getWords().clear();
 
@@ -150,19 +141,115 @@ public class QuerqyQueryExpander implements UserQueryAnalyzer, ConfigurableExten
 	static class TermFetcher extends AbstractNodeVisitor<Node> {
 
 		@Getter
-		List<WeightedWord>	words	= new ArrayList<>();
-		private Occur		occur;
+		List<QueryStringTerm>	words	= new ArrayList<>();
+		private Occur			occur;
 
 		@Override
 		public Node visit(BooleanQuery booleanQuery) {
-			this.occur = booleanQuery.occur;
-			return super.visit(booleanQuery);
+			if(booleanQuery.getClauses() != null &&  booleanQuery.getClauses().size() > 1) {
+
+				StringBuilder finalTermValue = new StringBuilder();
+				float boost = 0.0f;
+
+				for (BooleanClause clause : booleanQuery.getClauses()) {
+					if (clause instanceof DisjunctionMaxQuery) {
+
+						this.occur = clause.getOccur();
+						List<?> innerClauses = ((DisjunctionMaxQuery) clause).getClauses();
+
+						if (innerClauses != null && innerClauses.size() > 0 && innerClauses.get(0) instanceof Term) {
+							Term termClause = (Term) innerClauses.get(0);
+
+							if(termClause instanceof BoostedTerm) {
+								boost = ((BoostedTerm) termClause).getBoost();
+							}
+							String termClauseValue = termClause.getValue().toString();
+							finalTermValue.append(termClauseValue);
+							finalTermValue.append(" ");
+						}
+					}
+				}
+
+				if(finalTermValue.length() > 0) {
+					finalTermValue.deleteCharAt(finalTermValue.length() - 1);
+				}
+
+				WeightedWord weightedWord;
+				if (boost != 0.0f) {
+					weightedWord = new WeightedWord(finalTermValue.toString(), boost);
+				} else {
+					weightedWord = new WeightedWord(finalTermValue.toString());
+				}
+				if (occur != null) {
+					weightedWord.setOccur(org.apache.lucene.search.BooleanClause.Occur.valueOf(occur.name()));
+					// guard MUST/NOT terms from analyzer
+					if (occur.equals(Occur.MUST) || occur.equals(Occur.MUST_NOT)) {
+						weightedWord.setQuoted(true);
+					}
+					this.occur = null;
+				}
+				words.add(weightedWord);
+
+				return null;
+
+			} else {
+				return super.visit(booleanQuery);
+			}
 		}
 
 		@Override
 		public Node visit(DisjunctionMaxQuery disjunctionMaxQuery) {
 			this.occur = disjunctionMaxQuery.occur;
 			return super.visit(disjunctionMaxQuery);
+		}
+
+		@Override
+		public Node visit(RawQuery rawQuery) {
+			this.occur = rawQuery.occur;
+			String rawQueryString = ((StringRawQuery) rawQuery).getQueryString();
+
+			if (rawQueryString.indexOf(':') > 0) {
+
+				if(rawQueryString.indexOf(' ') > 0) {
+					String[] rawFiltersSplit = rawQueryString.split(" ");
+					for(String rawFilter: rawFiltersSplit) {
+						if(rawFilter.indexOf(':') > 0) {
+							QueryFilterTerm queryFilterTerm = getQueryFilterTerm(rawFilter);
+							words.add(queryFilterTerm);
+						} else {
+							words.add(new RawQueryString(rawQueryString));
+						}
+					}
+				} else {
+					QueryFilterTerm queryFilterTerm = getQueryFilterTerm(rawQueryString);
+					words.add(queryFilterTerm);
+				}
+			}
+			else {
+				words.add(new RawQueryString(rawQueryString));
+			}
+			return super.visit(rawQuery);
+		}
+
+		private QueryFilterTerm getQueryFilterTerm(String rawQueryString) {
+
+			String[] rawQuerySplit = rawQueryString.split(":");
+			// TODO: Make it possible to use " AND " as a conjunction for
+			// these values
+			String fieldName = rawQuerySplit[0];
+			String value = rawQuerySplit[1];
+
+			org.apache.lucene.search.BooleanClause.Occur occur;
+			if(Occur.MUST_NOT.equals(this.occur)) {
+				occur = org.apache.lucene.search.BooleanClause.Occur.MUST_NOT;
+			} else {
+				occur = org.apache.lucene.search.BooleanClause.Occur.MUST;
+			}
+
+			QueryFilterTerm queryFilterTerm = new QueryFilterTerm(fieldName, value);
+			queryFilterTerm.setOccur(occur);
+
+			return queryFilterTerm;
 		}
 
 		@Override
@@ -176,6 +263,11 @@ public class QuerqyQueryExpander implements UserQueryAnalyzer, ConfigurableExten
 			}
 			if (occur != null) {
 				weightedWord.setOccur(org.apache.lucene.search.BooleanClause.Occur.valueOf(occur.name()));
+
+				// guard MUST/NOT terms from analyzer
+				if (occur.equals(Occur.MUST) || occur.equals(Occur.MUST_NOT)) {
+					weightedWord.setQuoted(true);
+				}
 				occur = null;
 			}
 			words.add(weightedWord);

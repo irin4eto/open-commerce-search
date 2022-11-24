@@ -3,6 +3,7 @@ package de.cxp.ocs.elasticsearch.facets;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.Function;
 
 import org.elasticsearch.search.aggregations.AggregationBuilder;
 import org.elasticsearch.search.aggregations.AggregationBuilders;
@@ -35,8 +36,8 @@ public class IntervalFacetCreator extends NestedFacetCreator {
 	@Setter
 	private int interval = 5;
 
-	public IntervalFacetCreator(Map<String, FacetConfig> facetConfigs) {
-		super(facetConfigs);
+	public IntervalFacetCreator(Map<String, FacetConfig> facetConfigs, Function<String, FacetConfig> defaultFacetConfigProvider) {
+		super(facetConfigs, defaultFacetConfigProvider);
 	}
 
 	@Override
@@ -170,16 +171,15 @@ public class IntervalFacetCreator extends NestedFacetCreator {
 	@NoArgsConstructor
 	private static class NumericFacetEntryBuilder {
 
-		Double	lowerBound;
-		Double	upperBound;
+		Number	lowerBound;
+		Number	upperBound;
 		long	currentDocumentCount	= 0;
 		int		currentVariantCount		= 0;
 
 		NumericFacetEntryBuilder(NumberResultFilter facetFilter) {
-			Number lowerBoundValue = facetFilter.getLowerBound();
-			Number upperBoundValue = facetFilter.getUpperBound();
-			lowerBound = lowerBoundValue == null ? null : lowerBoundValue.doubleValue();
-			upperBound = upperBoundValue == null ? null : upperBoundValue.doubleValue();
+			lowerBound = facetFilter.getLowerBound();
+			upperBound = facetFilter.getUpperBound();
+			
 		}
 
 		String[] getFilterValues() {

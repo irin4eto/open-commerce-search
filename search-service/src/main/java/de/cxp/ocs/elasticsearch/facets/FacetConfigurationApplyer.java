@@ -2,16 +2,8 @@ package de.cxp.ocs.elasticsearch.facets;
 
 import static de.cxp.ocs.elasticsearch.facets.FacetFactory.getLabel;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
+import java.util.*;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import org.elasticsearch.index.query.QueryBuilder;
@@ -27,6 +19,7 @@ import de.cxp.ocs.config.FacetConfiguration.FacetConfig;
 import de.cxp.ocs.config.FacetType;
 import de.cxp.ocs.config.Field;
 import de.cxp.ocs.config.FieldType;
+import de.cxp.ocs.config.IndexedField;
 import de.cxp.ocs.elasticsearch.query.filter.FilterContext;
 import de.cxp.ocs.elasticsearch.query.filter.InternalResultFilter;
 import de.cxp.ocs.model.result.Facet;
@@ -50,11 +43,12 @@ public class FacetConfigurationApplyer {
 	static final String IS_MANDATORY_META_KEY = "isMandatory";
 
 	private final Map<String, FacetConfig> facetsBySourceField = new HashMap<>();
-
 	private final List<FacetCreator>						facetCreators			= new ArrayList<>();
 	private final Map<FacetCreatorClassifier, FacetCreator>	facetCreatorsByTypes	= new HashMap<>();
 
 	private int maxFacets;
+
+	private final List<FacetFilter> facetFilters = new ArrayList<>();
 
 	@Data
 	@RequiredArgsConstructor
@@ -83,7 +77,19 @@ public class FacetConfigurationApplyer {
 	private Set<String> excludeFields = Collections.emptySet();
 
 	public FacetConfigurationApplyer(SearchContext context) {
+		Function<String, FacetConfig> defaultFacetConfigProvider = getDefaultFacetConfigProvider(context);
+
 		maxFacets = context.config.getFacetConfiguration().getMaxFacets();
+
+		loadFacetConfig(defaultFacetConfigProvider, context);
+
+		facetFilters.add(new FacetCoverageFilter());
+		facetFilters.add(new FacetSizeFilter());
+		facetFilters.add(new FacetDependencyFilter(facetsBySourceField));
+	}
+
+	public void loadFacetConfig(Function<String, FacetConfig> defaultFacetConfigProvider, SearchContext context) {
+		String defaultFacetType = defaultFacetConfigProvider.apply("").getType();
 
 		// I tried to do this whole method in a more generic way, but such code
 		// is less readable even if shorter
@@ -120,6 +126,17 @@ public class FacetConfigurationApplyer {
 			else if ("ignore".equalsIgnoreCase(facetConfig.getType())) {
 				ignoredFields.add(facetField);
 				continue;
+			}
+
+			if (facetField instanceof IndexedField) {
+				int valueCardinality = ((IndexedField) facetField).getValueCardinality();
+				if (valueCardinality > 0 && valueCardinality < facetConfig.getMinValueCount()) {
+					log.warn(
+							"facet {} on field {} has minValueCount={}, but there are only {} values indexed at all. Setting minValueCount accordingly.",
+							facetConfig.getLabel(), facetConfig.getSourceField(), facetConfig.getMinValueCount(),
+							valueCardinality);
+					facetConfig.setMinValueCount(valueCardinality);
+				}
 			}
 
 			if (FieldType.CATEGORY.equals(facetField.getType())) {
@@ -162,24 +179,29 @@ public class FacetConfigurationApplyer {
 		}
 
 		// build all generic facet creators passing the specific configs to it
-		CategoryFacetCreator categoryFacetCreator = new CategoryFacetCreator(hierarchicalFacets);
+		CategoryFacetCreator categoryFacetCreator = new CategoryFacetCreator(hierarchicalFacets,
+				FacetType.HIERARCHICAL.name().equals(defaultFacetType) ? defaultFacetConfigProvider : null);
 		categoryFacetCreator.setGeneralExcludedFields(getNamesOfMatchingFields(ignoredFields, FieldType.CATEGORY));
 		facetCreators.add(categoryFacetCreator);
 		facetCreatorsByTypes.put(FacetCreatorClassifier.hierarchicalFacet, categoryFacetCreator);
 
-		NestedFacetCreator masterTermFacetCreator = new TermFacetCreator(termFacets).setMaxFacets(maxFacets);
+		Locale locale = context.config.getLocale();
+		NestedFacetCreator masterTermFacetCreator = new TermFacetCreator(termFacets, FacetType.TERM.name().equals(defaultFacetType) ? defaultFacetConfigProvider : null, locale)
+				.setMaxFacets(maxFacets);
 		masterTermFacetCreator.setGeneralExcludedFields(getNamesOfMatchingFields(ignoredFields, FieldType.STRING));
 		facetCreators.add(masterTermFacetCreator);
 		facetCreatorsByTypes.put(FacetCreatorClassifier.masterTermFacet, masterTermFacetCreator);
 
-		NestedFacetCreator intervalFacetCreator = new IntervalFacetCreator(intervalFacets).setMaxFacets(maxFacets);
+		NestedFacetCreator intervalFacetCreator = new IntervalFacetCreator(intervalFacets, FacetType.INTERVAL.name().equals(defaultFacetType) ? defaultFacetConfigProvider : null)
+				.setMaxFacets(maxFacets);
 
 		// range facets are only created for configured facets, so if there are
 		// none, don't use that creator at all
 		if (!rangeFacets.isEmpty()) {
 			// TODO: FacetCreators that run on the same nested field, should be
 			// grouped to use a single nested-aggregation for their aggregations
-			NestedFacetCreator rangeFacetCreator = new RangeFacetCreator(rangeFacets).setMaxFacets(maxFacets);
+			NestedFacetCreator rangeFacetCreator = new RangeFacetCreator(rangeFacets, FacetType.RANGE.name().equals(defaultFacetType) ? defaultFacetConfigProvider : null)
+					.setMaxFacets(maxFacets);
 			rangeFacetCreator.setGeneralExcludedFields(getNamesOfMatchingFields(ignoredFields, FieldType.NUMBER));
 			facetCreators.add(rangeFacetCreator);
 			facetCreatorsByTypes.put(FacetCreatorClassifier.masterRangeFacet, rangeFacetCreator);
@@ -197,17 +219,21 @@ public class FacetConfigurationApplyer {
 		facetCreatorsByTypes.put(FacetCreatorClassifier.masterIntervalFacet, intervalFacetCreator);
 
 		List<FacetCreator> variantFacetCreators = new ArrayList<>();
-		NestedFacetCreator variantTermFacetCreator = new TermFacetCreator(variantTermFacets).setMaxFacets(maxFacets);
-		variantTermFacetCreator.setGeneralExcludedFields(getNamesOfMatchingFields(ignoredFields, FieldType.NUMBER));
+		NestedFacetCreator variantTermFacetCreator = new TermFacetCreator(variantTermFacets, FacetType.TERM.name().equals(defaultFacetType) ? defaultFacetConfigProvider : null, locale)
+				.setMaxFacets(maxFacets);
+		variantTermFacetCreator.setGeneralExcludedFields(getNamesOfMatchingFields(ignoredFields, FieldType.STRING));
 		variantFacetCreators.add(variantTermFacetCreator);
 		facetCreatorsByTypes.put(FacetCreatorClassifier.variantTermFacet, new VariantFacetCreator(Collections.singleton(variantTermFacetCreator)));
 
-		NestedFacetCreator variantIntervalFacetCreator = new IntervalFacetCreator(variantIntervalFacets).setMaxFacets(maxFacets);
+		NestedFacetCreator variantIntervalFacetCreator = new IntervalFacetCreator(variantIntervalFacets,
+				FacetType.INTERVAL.name().equals(defaultFacetType) ? defaultFacetConfigProvider : null).setMaxFacets(maxFacets);
+		variantIntervalFacetCreator.setGeneralExcludedFields(getNamesOfMatchingFields(ignoredFields, FieldType.NUMBER));
 		variantFacetCreators.add(variantIntervalFacetCreator);
 		facetCreatorsByTypes.put(FacetCreatorClassifier.variantIntervalFacet, new VariantFacetCreator(Collections.singleton(variantIntervalFacetCreator)));
 
 		if (!variantRangeFacets.isEmpty()) {
-			NestedFacetCreator variantRangeFacetCreator = new RangeFacetCreator(variantRangeFacets).setMaxFacets(maxFacets);
+			NestedFacetCreator variantRangeFacetCreator = new RangeFacetCreator(variantRangeFacets,
+					FacetType.RANGE.name().equals(defaultFacetType) ? defaultFacetConfigProvider : null).setMaxFacets(maxFacets);
 			variantRangeFacetCreator.setGeneralExcludedFields(getNamesOfMatchingFields(ignoredFields, FieldType.NUMBER));
 			variantFacetCreators.add(variantRangeFacetCreator);
 			facetCreatorsByTypes.put(FacetCreatorClassifier.variantRangeFacet, new VariantFacetCreator(Collections.singleton(variantRangeFacetCreator)));
@@ -222,6 +248,25 @@ public class FacetConfigurationApplyer {
 
 		// consolidated variant facet creator
 		facetCreators.add(new VariantFacetCreator(variantFacetCreators));
+	}
+
+	private Function<String, FacetConfig> getDefaultFacetConfigProvider(SearchContext context) {
+		FacetConfig defaultFacetConf = context.getConfig().getFacetConfiguration().getDefaultFacetConfiguration();
+		if (defaultFacetConf.equals(new FacetConfig())) {
+			return name -> new FacetConfig(name, name);
+		}
+
+		return name -> new FacetConfig(name, name)
+					.setExcludeFromFacetLimit(defaultFacetConf.isExcludeFromFacetLimit())
+					.setMetaData(defaultFacetConf.getMetaData())
+					.setMultiSelect(defaultFacetConf.isMultiSelect())
+					.setOptimalValueCount(defaultFacetConf.getOptimalValueCount())
+					.setOrder(defaultFacetConf.getOrder())
+					.setPreferVariantOnFilter(defaultFacetConf.isPreferVariantOnFilter())
+					.setShowUnselectedOptions(defaultFacetConf.isShowUnselectedOptions())
+					.setSourceField(name)
+					.setType(defaultFacetConf.getType())
+					.setValueOrder(defaultFacetConf.getValueOrder());
 	}
 
 	private Set<String> getNamesOfMatchingFields(Set<Field> ignoredFields, FieldType fieldType) {
@@ -250,7 +295,7 @@ public class FacetConfigurationApplyer {
 	 * This method uses the initialized FacetCreators to build the right
 	 * aggregations in respect of the active post filters.
 	 * </p>
-	 * 
+	 *
 	 * <strong>Background / Details:</strong>
 	 * <p>
 	 * For facets that should stay the same, even if one of its filters was
@@ -283,8 +328,8 @@ public class FacetConfigurationApplyer {
 	 * <p>
 	 * More details at http://stackoverflow.com/questions/41369749
 	 * </p>
-	 * 
-	 * 
+	 *
+	 *
 	 * @param filterContext
 	 *        context that holds the filter queries
 	 * @return
@@ -371,6 +416,8 @@ public class FacetConfigurationApplyer {
 			facets = facetsFromFilteredAggregations(aggregations, filterContext, linkBuilder);
 		}
 
+		filterFacets(facets, filterContext, matchCount);
+
 		// sort by order and facet coverage
 		facets.sort(new Comparator<Facet>() {
 
@@ -398,6 +445,28 @@ public class FacetConfigurationApplyer {
 		return facets.size() > actualMaxFacets ? facets.subList(0, actualMaxFacets) : facets;
 	}
 
+	private void filterFacets(List<Facet> facets, FilterContext filterContext, long matchCount) {
+		Iterator<Facet> facetIterator = facets.iterator();
+		while (facetIterator.hasNext()) {
+			Facet facet = facetIterator.next();
+			if (facet.isFiltered)
+				continue;
+
+			FacetConfig facetConfig = facetsBySourceField.get(facet.getFieldName());
+			if (facetConfig != null ) {
+				for (FacetFilter facetFilter : facetFilters) {
+					if (!facetFilter.isVisibleFacet(facet, facetConfig, filterContext, maxFacets)) {
+						log.debug("removing facet {} because of filter {}", facetConfig.getLabel(),
+								facetFilter.getClass().getSimpleName());
+						facetIterator.remove();
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	
 	private List<Facet> facetsFromFilteredAggregations(Aggregations aggregations, FilterContext filterContext, SearchQueryBuilder linkBuilder) {
 		Map<String, Facet> facets = new HashMap<>();
 

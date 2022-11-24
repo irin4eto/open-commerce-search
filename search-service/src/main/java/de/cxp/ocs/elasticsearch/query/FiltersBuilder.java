@@ -3,13 +3,8 @@ package de.cxp.ocs.elasticsearch.query;
 import static de.cxp.ocs.config.FieldConstants.VARIANTS;
 import static de.cxp.ocs.util.ESQueryUtils.mergeQueries;
 
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.Map.Entry;
-import java.util.Set;
 import java.util.stream.Collectors;
 
 import org.apache.lucene.search.join.ScoreMode;
@@ -21,13 +16,7 @@ import com.google.common.base.Functions;
 import de.cxp.ocs.SearchContext;
 import de.cxp.ocs.config.FacetConfiguration.FacetConfig;
 import de.cxp.ocs.config.FieldConfigIndex;
-import de.cxp.ocs.elasticsearch.query.filter.FilterContext;
-import de.cxp.ocs.elasticsearch.query.filter.InternalResultFilter;
-import de.cxp.ocs.elasticsearch.query.filter.InternalResultFilterAdapter;
-import de.cxp.ocs.elasticsearch.query.filter.NumberResultFilter;
-import de.cxp.ocs.elasticsearch.query.filter.NumberResultFilterAdapter;
-import de.cxp.ocs.elasticsearch.query.filter.TermResultFilter;
-import de.cxp.ocs.elasticsearch.query.filter.TermResultFilterAdapter;
+import de.cxp.ocs.elasticsearch.query.filter.*;
 
 public class FiltersBuilder {
 
@@ -39,6 +28,7 @@ public class FiltersBuilder {
 	static {
 		filterAdapters.put(NumberResultFilter.class, new NumberResultFilterAdapter());
 		filterAdapters.put(TermResultFilter.class, new TermResultFilterAdapter());
+		filterAdapters.put(PathResultFilter.class, new PathResultFilterAdapter());
 	}
 
 	public FiltersBuilder(SearchContext context) {
@@ -48,15 +38,40 @@ public class FiltersBuilder {
 		indexedFieldConfig = context.getFieldConfigIndex();
 	}
 
-	public FilterContext buildFilterContext(List<InternalResultFilter> filters) {
+	public FilterContext buildFilterContext(List<InternalResultFilter> filters, List<InternalResultFilter> querqyFilters) {
 		Map<String, InternalResultFilter> filtersByName = filters.stream().collect(Collectors.toMap(f -> f.getField().getName(), Functions.identity()));
 
-		if (filters.isEmpty()) return new FilterContext(filtersByName);
+		if (filters.isEmpty() && querqyFilters.isEmpty()) return new FilterContext(filtersByName);
 
 		Map<String, QueryBuilder> basicFilterQueries = new HashMap<>();
 		Map<String, QueryBuilder> postFilterQueries = new HashMap<>();
 
 		// collect filter queries on master and variant level
+		buildFilterQueries(filters, basicFilterQueries, postFilterQueries, false);
+		buildFilterQueries(querqyFilters, basicFilterQueries, postFilterQueries, true);
+
+		MasterVariantQuery postFilterQuery = buildFilters(postFilterQueries);
+		QueryBuilder joinedPostFilters = mergeQueries(postFilterQuery.getMasterLevelQuery(), postFilterQuery
+				.getVariantLevelQuery());
+
+		return new FilterContext(
+				filtersByName,
+				Collections.unmodifiableMap(basicFilterQueries),
+				Collections.unmodifiableMap(postFilterQueries),
+				buildFilters(basicFilterQueries),
+				joinedPostFilters,
+				postFilterQuery.getVariantLevelQuery());
+	}
+
+	/**
+	 *
+	 * @param filters
+	 * @param basicFilterQueries
+	 * @param postFilterQueries
+	 * @param addAllFiltersAsBasicFilters - if externally defined filters are used, they have to be treated as a basic filter
+	 */
+	private void buildFilterQueries(List<InternalResultFilter> filters, Map<String, QueryBuilder> basicFilterQueries,
+		Map<String, QueryBuilder> postFilterQueries, boolean addAllFiltersAsBasicFilters) {
 		for (InternalResultFilter filter : filters) {
 			@SuppressWarnings("unchecked")
 			InternalResultFilterAdapter<? super InternalResultFilter> filterAdapter = (InternalResultFilterAdapter<? super InternalResultFilter>) filterAdapters
@@ -82,24 +97,15 @@ public class FiltersBuilder {
 				}
 			}
 
-			if (isBasicQuery(filter.getField().getName())) {
-				basicFilterQueries.put(filter.getField().getName(), filterQuery);
-			}
-			else {
+			if (isBasicQuery(filter.getField().getName()) || addAllFiltersAsBasicFilters) {
+				QueryBuilder conflictingFilter = basicFilterQueries.put(filter.getField().getName(), filterQuery);
+				if (conflictingFilter != null) {
+					basicFilterQueries.put(filter.getField().getName(), mergeQueries(conflictingFilter, filterQuery));
+				}
+			} else {
 				postFilterQueries.put(filter.getField().getName(), filterQuery);
 			}
 		}
-		MasterVariantQuery postFilterQuery = buildFilters(postFilterQueries);
-		QueryBuilder joinedPostFilters = mergeQueries(postFilterQuery.getMasterLevelQuery(), postFilterQuery
-				.getVariantLevelQuery());
-
-		return new FilterContext(
-				filtersByName,
-				Collections.unmodifiableMap(basicFilterQueries),
-				Collections.unmodifiableMap(postFilterQueries),
-				buildFilters(basicFilterQueries),
-				joinedPostFilters,
-				postFilterQuery.getVariantLevelQuery());
 	}
 
 	private boolean isBasicQuery(String fieldName) {

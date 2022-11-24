@@ -14,7 +14,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
-import javax.annotation.PostConstruct;
 import javax.servlet.http.HttpServletRequest;
 
 import org.elasticsearch.ElasticsearchStatusException;
@@ -27,6 +26,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cloud.context.config.annotation.RefreshScope;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.web.bind.annotation.CrossOrigin;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -66,6 +66,7 @@ import lombok.extern.slf4j.Slf4j;
 @CrossOrigin(origins = "http://localhost:8081")
 @RestController
 @RequestMapping(path = "/search-api/v1")
+@EnableScheduling
 @Slf4j
 public class SearchController implements SearchService {
 
@@ -90,14 +91,16 @@ public class SearchController implements SearchService {
 
 	private final Cache<String, Exception> brokenTenantsCache = CacheBuilder.newBuilder()
 			.expireAfterWrite(5, TimeUnit.MINUTES)
+			.maximumSize(64)
 			.build();
 
-	@PostConstruct
-	@Scheduled(fixedDelayString = "${ocs.scheduler.refresh-config-delay-ms:600000}")
+	@Scheduled(fixedDelayString = "${ocs.scheduler.refresh-config-delay-ms:60000}")
 	public void refreshAllConfigs() {
 		Set<String> configuredTenants = plugins.getConfigurationProvider().getConfiguredTenants();
-		log.info("SearchController {} configured tenants {}", searchClientCache.size() == 0 ? "initializing" : "reloading", configuredTenants);
-		configuredTenants.forEach(this::flushConfig);
+		if (configuredTenants.size() > 0) {
+			log.info("SearchController {} configured tenants {}", searchClientCache.size() == 0 ? "initializing" : "reloading", configuredTenants);
+			configuredTenants.forEach(this::flushConfig);
+		}
 	}
 
 	@GetMapping("/flushConfig/{tenant}")
@@ -105,22 +108,35 @@ public class SearchController implements SearchService {
 		HttpStatus status;
 		synchronized (tenant.intern()) {
 			MDC.put("tenant", tenant);
-			brokenTenantsCache.invalidate(tenant);
-			SearchContext searchContext = loadContext(tenant);
-			SearchContext oldConfig = searchContexts.put(tenant, searchContext);
-			if (oldConfig == null) {
-				log.info("config successfuly loaded for tenant {}", tenant);
-				status = HttpStatus.CREATED;
+			try {
+				brokenTenantsCache.invalidate(tenant);
+				SearchContext searchContext = loadContext(tenant);
+				SearchContext oldConfig = searchContexts.put(tenant, searchContext);
+				if (oldConfig == null) {
+					log.info("config successfuly loaded for tenant {}", tenant);
+					status = HttpStatus.CREATED;
+				} else if (oldConfig.equals(searchContexts.get(tenant))) {
+					log.info("config flush did not modify config for tenant {}", tenant);
+					status = HttpStatus.NOT_MODIFIED;
+				} else {
+					log.info("config successfuly reloaded for tenant {}", tenant);
+					status = HttpStatus.OK;
+					searchClientCache.put(tenant, initializeSearcher(searchContext));
+				}
 			}
-			else if (oldConfig.equals(searchContexts.get(tenant))) {
-				log.info("config flush did not modify config for tenant {}", tenant);
-				status = HttpStatus.NOT_MODIFIED;
+			catch (ElasticsearchStatusException esx) {
+				try {
+					handleUnavailableIndex(tenant, esx);
+					// if this method does not throw a NotFoundException
+					// the error is about something else
+					log.error("Error while flushing config for tenant {}", tenant, esx);
+					status = HttpStatus.INTERNAL_SERVER_ERROR;
+				}
+				catch (NotFoundException notFound) {
+					status = HttpStatus.NOT_FOUND;
+				}
 			}
-			else {
-				log.info("config successfuly reloaded for tenant {}", tenant);
-				status = HttpStatus.OK;
-				searchClientCache.put(tenant, initializeSearcher(searchContext));
-			}
+
 			MDC.remove("tenant");
 		}
 
@@ -148,11 +164,11 @@ public class SearchController implements SearchService {
 			checkTenant(tenant);
 
 			long start = System.currentTimeMillis();
-			SearchContext searchContext = searchContexts.computeIfAbsent(tenant, this::loadContext);
-
-			final InternalSearchParams parameters = extractInternalParams(searchQuery, filters, searchContext);
-
 			try {
+				SearchContext searchContext = searchContexts.computeIfAbsent(tenant, this::loadContext);
+
+				final InternalSearchParams parameters = extractInternalParams(searchQuery, filters, searchContext);
+
 				final Searcher searcher = searchClientCache.get(tenant, () -> initializeSearcher(searchContext));
 				if (heroProducts != null) {
 					parameters.heroProductSets = HeroProductHandler.resolve(heroProducts, searcher, searchContext);
@@ -166,7 +182,7 @@ public class SearchController implements SearchService {
 				return result;
 			}
 			catch (ElasticsearchStatusException esx) {
-				handleUnavailableIndex(tenant, searchContext, esx);
+				handleUnavailableIndex(tenant, esx);
 
 				// TODO: in case an index was requested where it fails because
 				// fields are missing (so the application field configuration is
@@ -201,14 +217,19 @@ public class SearchController implements SearchService {
 		}
 	}
 
-	private void handleUnavailableIndex(String tenant, SearchContext searchContext, ElasticsearchStatusException esx) throws NotFoundException {
+	private void handleUnavailableIndex(String tenant, ElasticsearchStatusException esx) throws NotFoundException {
 		if (esx.getMessage().contains("type=index_not_found_exception")) {
 			// don't keep objects for invalid tenants
-			searchContexts.remove(tenant);
+			SearchContext removedContext = searchContexts.remove(tenant);
 			searchClientCache.invalidate(tenant);
+
+			String indexName = removedContext != null ? removedContext.config.getIndexName() : tenant;
+			NotFoundException notFoundException = new NotFoundException("Index " + indexName);
+
 			// and deny further requests for the next N minutes
-			brokenTenantsCache.put(tenant, esx);
-			throw new NotFoundException("Index " + searchContext.config.getIndexName());
+			brokenTenantsCache.put(tenant, notFoundException);
+
+			throw notFoundException;
 		}
 	}
 
@@ -217,6 +238,7 @@ public class SearchController implements SearchService {
 	public Document getDocument(@PathVariable("tenant") String tenant, @PathVariable("id") String docId) throws Exception {
 		MDC.put("tenant", tenant);
 		Document foundDoc = null;
+		checkTenant(tenant);
 		try {
 			SearchContext searchContext = searchContexts.computeIfAbsent(tenant, this::loadContext);
 			GetRequest getRequest = new GetRequest(searchContext.getConfig().getIndexName(), docId);
@@ -224,6 +246,9 @@ public class SearchController implements SearchService {
 			if (getResponse.isExists()) {
 				foundDoc = ResultMapper.mapToOriginalDocument(getResponse.getId(), getResponse.getSource(), searchContext.fieldConfigIndex);
 			}
+		}
+		catch (ElasticsearchStatusException esx) {
+			handleUnavailableIndex(tenant, esx);
 		}
 		finally {
 			MDC.remove("tenant");

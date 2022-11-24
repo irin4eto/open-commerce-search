@@ -1,22 +1,13 @@
 package de.cxp.ocs.elasticsearch.query.builder;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 import org.elasticsearch.client.RestHighLevelClient;
 
 import de.cxp.ocs.SearchContext;
-import de.cxp.ocs.config.Field;
-import de.cxp.ocs.config.FieldConfigIndex;
-import de.cxp.ocs.config.FieldUsage;
-import de.cxp.ocs.config.QueryBuildingSetting;
-import de.cxp.ocs.config.QueryConfiguration;
+import de.cxp.ocs.config.*;
 import de.cxp.ocs.config.QueryConfiguration.QueryCondition;
 import de.cxp.ocs.elasticsearch.query.builder.ConditionalQueries.ComposedPredicate;
 import de.cxp.ocs.elasticsearch.query.builder.ConditionalQueries.ConditionalQuery;
@@ -139,14 +130,18 @@ public class ESQueryFactoryBuilder {
 	private Map<String, Float> loadFields(Map<String, Float> weightedFields) {
 		Map<String, Float> validatedFields = new HashMap<>();
 		FieldConfigIndex fieldConfig = context.getFieldConfigIndex();
+		Set<String> ignoredFields = new HashSet<>();
 		weightedFields.forEach((fieldNamePattern, weight) -> {
 			if (isSearchableField(fieldConfig, fieldNamePattern)) {
 				validatedFields.put(fieldNamePattern, weight);
 			}
 			else {
-				log.warn("ignored field {} for query builder, because its not configured for search", fieldNamePattern);
+				ignoredFields.add(fieldNamePattern);
 			}
 		});
+		if (ignoredFields.size() > 0) {
+			log.info("Ignored unavailable fields for search: " + ignoredFields.toString());
+		}
 		return validatedFields;
 	}
 

@@ -4,11 +4,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
+import java.util.*;
 import java.util.regex.Pattern;
 
 import org.apache.commons.lang3.StringUtils;
@@ -22,7 +18,6 @@ import com.google.common.collect.Sets;
 import de.cxp.ocs.config.FacetConfiguration.FacetConfig;
 import de.cxp.ocs.config.Field;
 import de.cxp.ocs.elasticsearch.query.filter.InternalResultFilter;
-import de.cxp.ocs.elasticsearch.query.filter.TermResultFilter;
 import de.cxp.ocs.model.result.SortOrder;
 import de.cxp.ocs.model.result.Sorting;
 
@@ -63,7 +58,7 @@ public class SearchQueryBuilder {
 		if (!params.filters.isEmpty()) {
 			for (InternalResultFilter filter : params.filters) {
 				String paramName = filter.getField().getName();
-				if (filter instanceof TermResultFilter && ((TermResultFilter) filter).isFilterOnId()) {
+				if (filter.isFilterOnId()) {
 					paramName += SearchParamsParser.ID_FILTER_SUFFIX;
 				}
 				urlParams.put(paramName, joinParameterValues(filter.getValues()));
@@ -180,24 +175,49 @@ public class SearchQueryBuilder {
 			}
 		} else {
 			return searchQueryLink.getRawQuery();
+		}
+	}
 
+	/**
+	 * the complete filter parameter and returns the link.
+	 * 
+	 * @param facetConfig
+	 * @return
+	 */
+	public String withoutFilterAsLink(FacetConfig facetConfig) {
+		String filterName = getFilterName(facetConfig);
+		if (containsParameter(filterName)) {
+			URIBuilder linkBuilder = new URIBuilder(searchQueryLink);
+			List<NameValuePair> queryParams = linkBuilder.getQueryParams();
+			queryParams.removeIf(nvp -> nvp.getName().equals(filterName));
+			linkBuilder.setParameters(queryParams);
+			try {
+				return linkBuilder.build().getRawQuery();
+			}
+			catch (URISyntaxException e) {
+				// should be impossible
+				throw new IllegalArgumentException("removing parameter " + filterName + " caused URISyntaxException", e);
+			}
+		}
+		else {
+			return searchQueryLink.getRawQuery();
 		}
 	}
 
 	private String getFilterName(FacetConfig facetConfig) {
 		String filterName = facetConfig.getSourceField();
 		InternalResultFilter filter = filters.get(filterName);
-		if (filter != null && filter instanceof TermResultFilter && ((TermResultFilter) filter).isFilterOnId()) {
+		if (filter != null && filter.isFilterOnId()) {
 			filterName += SearchParamsParser.ID_FILTER_SUFFIX;
 		}
 		return filterName;
 	}
 
-	public String withFilterAsLink(FacetConfig facetConfig, String... filterValues) {
+	public String withFilterAsLink(FacetConfig facetConfig, String... filterInputValues) {
 		String filterName = getFilterName(facetConfig);
-		String filterValue = joinParameterValues(filterValues);
-		if (isFilterSelected(filterName, filterValue)) {
-			return searchQueryLink.toString();
+		String filterValues = joinParameterValues(filterInputValues);
+		if (isFilterSelected(filterName, filterValues)) {
+			return searchQueryLink.getRawQuery();
 		}
 		if (searchQueryLink.toString().matches(".*[?&]" + Pattern.quote(filterName) + "=.*")) {
 			URIBuilder linkBuilder = new URIBuilder(searchQueryLink);
@@ -206,24 +226,67 @@ public class SearchQueryBuilder {
 						.filter(param -> filterName.equals(param.getName())).findFirst()
 						.map(NameValuePair::getValue);
 				linkBuilder.setParameter(filterName, otherValues
-						.map(val -> val + VALUE_DELIMITER + joinParameterValues(filterValue)).orElse(filterValue));
+						.map(val -> val + VALUE_DELIMITER + filterValues).orElse(filterValues));
 			} else {
-				linkBuilder.setParameter(filterName, filterValue);
+				linkBuilder.setParameter(filterName, filterValues);
 			}
 			try {
 				return linkBuilder.build().getRawQuery();
 			} catch (URISyntaxException e) {
 				throw new IllegalArgumentException(
-						"parameter caused URISyntaxException: " + filterName + "=" + filterValue, e);
+						"parameter caused URISyntaxException: " + filterName + "=" + filterValues, e);
 			}
 		} else {
-			String newParam = filterName + "=" + urlEncodeValue(filterValue);
-			String query = searchQueryLink.getRawQuery();
-			if (query == null || query.length() == 0)
-				return newParam;
-			else
-				return query + "&" + newParam;
+			return withParameterAppended(filterName, filterValues);
 		}
+	}
+
+	private String withParameterAppended(String filterName, String filterValues) {
+		String newParam = filterName + "=" + urlEncodeValue(filterValues);
+		String query = searchQueryLink.getRawQuery();
+		if (query == null || query.length() == 0) {
+			return newParam;
+		}
+		else {
+			return query + "&" + newParam;
+		}
+	}
+
+	/**
+	 * <p>
+	 * Returns a URL with that filter set.
+	 * If the filter-name existed before, it will be replaced completely.
+	 * No multi-select value merging will be done.
+	 * </p>
+	 * <p>
+	 * This method moves the responsibility of value-joining to the caller
+	 * </p>
+	 * 
+	 * @param facetConfig
+	 * @param filterInputValues
+	 * @return
+	 */
+	public String withExactFilterAsLink(FacetConfig facetConfig, String... filterInputValues) {
+		String filterName = getFilterName(facetConfig);
+		String filterValues = joinParameterValues(filterInputValues);
+		if (containsParameter(filterName)) {
+			URIBuilder linkBuilder = new URIBuilder(searchQueryLink);
+			linkBuilder.setParameter(filterName, filterValues);
+			try {
+				return linkBuilder.build().getRawQuery();
+			}
+			catch (URISyntaxException e) {
+				throw new IllegalArgumentException(
+						"parameter caused URISyntaxException: " + filterName + "=" + filterValues, e);
+			}
+		}
+		else {
+			return withParameterAppended(filterName, filterValues);
+		}
+	}
+
+	private boolean containsParameter(String filterName) {
+		return searchQueryLink.getQuery() != null && searchQueryLink.getRawQuery().contains(filterName + "=");
 	}
 
 	/**
@@ -262,5 +325,6 @@ public class SearchQueryBuilder {
 	public String toString() {
 		return searchQueryLink.getRawQuery();
 	}
+
 
 }

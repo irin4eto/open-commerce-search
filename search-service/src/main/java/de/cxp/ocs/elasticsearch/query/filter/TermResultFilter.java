@@ -1,5 +1,7 @@
 package de.cxp.ocs.elasticsearch.query.filter;
 
+import java.util.Locale;
+
 import de.cxp.ocs.config.Field;
 import de.cxp.ocs.config.FieldConstants;
 import lombok.Data;
@@ -21,8 +23,15 @@ public class TermResultFilter implements InternalResultFilter {
 	private String fieldPrefix = FieldConstants.TERM_FACET_DATA;
 
 	public TermResultFilter(Field field, String... inputValues) {
+		this(Locale.ROOT, field, inputValues);
+	}
+
+	public TermResultFilter(Locale lowerCaseLocale, Field field, String... inputValues) {
 		this.field = field;
-		values = inputValues;
+		values = new String[inputValues.length];
+		for (int i = 0; i < inputValues.length; i++) {
+			values[i] = inputValues[i].toLowerCase(lowerCaseLocale);
+		}
 	}
 
 	public String getSingleValue() {
@@ -39,4 +48,5 @@ public class TermResultFilter implements InternalResultFilter {
 	public boolean isNestedFilter() {
 		return true;
 	}
+
 }

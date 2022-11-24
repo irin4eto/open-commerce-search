@@ -7,13 +7,8 @@ import static org.apache.commons.lang3.StringUtils.replace;
 import static org.apache.commons.lang3.StringUtils.split;
 import static org.apache.commons.lang3.StringUtils.splitPreserveAllTokens;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.Map.Entry;
-import java.util.Optional;
 
 import de.cxp.ocs.SearchContext;
 import de.cxp.ocs.config.Field;
@@ -22,7 +17,9 @@ import de.cxp.ocs.config.FieldConstants;
 import de.cxp.ocs.config.FieldUsage;
 import de.cxp.ocs.elasticsearch.query.filter.InternalResultFilter;
 import de.cxp.ocs.elasticsearch.query.filter.NumberResultFilter;
+import de.cxp.ocs.elasticsearch.query.filter.PathResultFilter;
 import de.cxp.ocs.elasticsearch.query.filter.TermResultFilter;
+import de.cxp.ocs.model.params.ArrangedSearchQuery;
 import de.cxp.ocs.model.params.SearchQuery;
 import de.cxp.ocs.model.result.SortOrder;
 import de.cxp.ocs.model.result.Sorting;
@@ -46,7 +43,7 @@ public class SearchParamsParser {
 		if (searchQuery.sort != null) {
 			parameters.sortings = parseSortings(searchQuery.sort, searchContext.getFieldConfigIndex());
 		}
-		parameters.filters = parseFilters(filters, searchContext.getFieldConfigIndex());
+		parameters.filters = parseFilters(filters, searchContext.getFieldConfigIndex(), searchContext.config.getLocale());
 
 		Map<String, String> customParams = filters == null ? Collections.emptyMap() : new HashMap<>(filters);
 		parameters.filters.forEach(f -> {
@@ -54,6 +51,10 @@ public class SearchParamsParser {
 			customParams.remove(f.getField().getName() + SearchParamsParser.ID_FILTER_SUFFIX);
 		});
 		parameters.customParams = customParams;
+
+		if (searchQuery instanceof ArrangedSearchQuery) {
+			parameters.includeMainResult = ((ArrangedSearchQuery) searchQuery).includeMainResult;
+		}
 
 		return parameters;
 	}
@@ -66,9 +67,10 @@ public class SearchParamsParser {
 	 *        parameters as sent in the request
 	 * @param fieldConfig
 	 *        the field configuration
+	 * @param locale
 	 * @return validated and enriched filter values for internal usage
 	 */
-	public static List<InternalResultFilter> parseFilters(Map<String, String> filterValues, FieldConfigIndex fieldConfig) {
+	public static List<InternalResultFilter> parseFilters(Map<String, String> filterValues, FieldConfigIndex fieldConfig, Locale locale) {
 		List<InternalResultFilter> filters = filterValues == null ? Collections.emptyList() : new ArrayList<>();
 
 		if (filterValues != null) {
@@ -92,7 +94,7 @@ public class SearchParamsParser {
 				if (matchingField.isPresent()) {
 					Field field = matchingField.get();
 					try {
-						filters.add(toInternalFilter(field, paramValue, isIdFilter));
+						filters.add(toInternalFilter(field, paramValue, isIdFilter, locale));
 					}
 					catch (IllegalArgumentException iae) {
 						log.error("Ignoring invalid filter parameter {}={}", paramName, paramValue);
@@ -104,11 +106,11 @@ public class SearchParamsParser {
 		return filters;
 	}
 
-	private static InternalResultFilter toInternalFilter(Field field, String paramValue, boolean isIdFilter) {
+	private static InternalResultFilter toInternalFilter(Field field, String paramValue, boolean isIdFilter, Locale locale) {
 		String[] paramValues = decodeValueDelimiter(split(paramValue, VALUE_DELIMITER));
 		switch (field.getType()) {
 			case CATEGORY:
-				return new TermResultFilter(field, paramValues)
+				return new PathResultFilter(field, paramValues)
 						.setFieldPrefix(FieldConstants.PATH_FACET_DATA)
 						.setFilterOnId(isIdFilter);
 			case NUMBER:
@@ -132,7 +134,7 @@ public class SearchParamsParser {
 						paramValues[0].isEmpty() ? null : Util.tryToParseAsNumber(paramValues[0]).orElseThrow(IllegalArgumentException::new),
 						paramValues[1].isEmpty() ? null : Util.tryToParseAsNumber(paramValues[1]).orElseThrow(IllegalArgumentException::new));
 			default:
-				return new TermResultFilter(field, paramValues)
+				return new TermResultFilter(locale, field, paramValues)
 						.setFilterOnId(isIdFilter);
 		}
 	}
