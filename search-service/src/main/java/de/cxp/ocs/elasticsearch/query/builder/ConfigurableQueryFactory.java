@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 import org.apache.lucene.search.BooleanClause.Occur;
 import org.elasticsearch.common.unit.Fuzziness;
@@ -27,6 +28,7 @@ import de.cxp.ocs.config.FieldConfigAccess;
 import de.cxp.ocs.config.FieldConstants;
 import de.cxp.ocs.config.QueryBuildingSetting;
 import de.cxp.ocs.elasticsearch.query.MasterVariantQuery;
+import de.cxp.ocs.elasticsearch.query.model.EscapeUtil;
 import de.cxp.ocs.elasticsearch.query.model.QueryStringTerm;
 import de.cxp.ocs.elasticsearch.query.model.WeightedWord;
 import de.cxp.ocs.spi.search.ESQueryFactory;
@@ -156,7 +158,7 @@ public class ConfigurableQueryFactory implements ESQueryFactory {
 				.append(" OR ")
 				.append('(')
 				.append('"')
-				.append(ESQueryUtils.buildQueryString(includeTerms, " "))
+				.append(getOriginalTermQuery(includeTerms))
 				.append('"')
 				.append(")^1.5");
 
@@ -172,6 +174,13 @@ public class ConfigurableQueryFactory implements ESQueryFactory {
 		}
 
 		return queryStringBuilder.toString();
+	}
+
+	private String getOriginalTermQuery(List<QueryStringTerm> includeTerms) {
+		return includeTerms.stream()
+				.map(QueryStringTerm::getWord)
+				.map(EscapeUtil::escapeReservedESCharacters)
+				.collect(Collectors.joining(" "));
 	}
 
 	private void attachQueryTermsAsShingles(List<QueryStringTerm> includeTerms, StringBuilder queryStringBuilder) {

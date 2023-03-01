@@ -42,6 +42,7 @@ public class FacetConfigurationApplyer {
 	 */
 	static final String IS_MANDATORY_META_KEY = "isMandatory";
 
+	private final Function<String, FacetConfig>				defaultFacetConfigProvider;
 	private final Map<String, FacetConfig> facetsBySourceField = new HashMap<>();
 	private final List<FacetCreator>						facetCreators			= new ArrayList<>();
 	private final Map<FacetCreatorClassifier, FacetCreator>	facetCreatorsByTypes	= new HashMap<>();
@@ -77,18 +78,18 @@ public class FacetConfigurationApplyer {
 	private Set<String> excludeFields = Collections.emptySet();
 
 	public FacetConfigurationApplyer(SearchContext context) {
-		Function<String, FacetConfig> defaultFacetConfigProvider = getDefaultFacetConfigProvider(context);
+		defaultFacetConfigProvider = getDefaultFacetConfigProvider(context);
 
 		maxFacets = context.config.getFacetConfiguration().getMaxFacets();
 
-		loadFacetConfig(defaultFacetConfigProvider, context);
+		loadFacetConfig(context);
 
 		facetFilters.add(new FacetCoverageFilter());
 		facetFilters.add(new FacetSizeFilter());
 		facetFilters.add(new FacetDependencyFilter(facetsBySourceField));
 	}
 
-	public void loadFacetConfig(Function<String, FacetConfig> defaultFacetConfigProvider, SearchContext context) {
+	public void loadFacetConfig(SearchContext context) {
 		String defaultFacetType = defaultFacetConfigProvider.apply("").getType();
 
 		// I tried to do this whole method in a more generic way, but such code
@@ -140,7 +141,7 @@ public class FacetConfigurationApplyer {
 			}
 
 			if (FieldType.CATEGORY.equals(facetField.getType())) {
-				if (!FacetType.HIERARCHICAL.name().equals(facetConfig.getType())) {
+				if (!FacetType.HIERARCHICAL.name().equalsIgnoreCase(facetConfig.getType())) {
 					log.warn("facet {} based on *category* field {} was configured as {} facet, but only 'hierarchical' type is supported",
 							facetConfig.getLabel(), facetField.getName(), facetConfig.getType());
 					facetConfig.setType(FacetType.HIERARCHICAL.name());
@@ -154,12 +155,12 @@ public class FacetConfigurationApplyer {
 				}
 			}
 			else if (FieldType.NUMBER.equals(facetField.getType())) {
-				if (facetConfig.getType().equals(FacetType.RANGE.name())) {
+				if (FacetType.RANGE.name().equalsIgnoreCase(facetConfig.getType())) {
 					if (facetField.isMasterLevel()) rangeFacets.put(facetField.getName(), facetConfig);
 					if (facetField.isVariantLevel()) variantRangeFacets.put(facetField.getName(), facetConfig);
 				}
 				else {
-					if (!facetConfig.getType().equals(FacetType.INTERVAL.name())) {
+					if (!FacetType.INTERVAL.name().equalsIgnoreCase(facetConfig.getType())) {
 						log.warn("facet {} based on *number* field {} was configured as {} facet, but only 'interval' or 'range' type is supported."
 								+ " To create a 'term' facet on numeric data, the according field has to be indexed as *string* field.",
 								facetConfig.getLabel(), facetField.getName(), facetConfig.getType());
@@ -453,9 +454,12 @@ public class FacetConfigurationApplyer {
 				continue;
 
 			FacetConfig facetConfig = facetsBySourceField.get(facet.getFieldName());
+			if (facetConfig == null) {
+				facetConfig = defaultFacetConfigProvider.apply(facet.getFieldName());
+			}
 			if (facetConfig != null ) {
 				for (FacetFilter facetFilter : facetFilters) {
-					if (!facetFilter.isVisibleFacet(facet, facetConfig, filterContext, maxFacets)) {
+					if (!facetFilter.isVisibleFacet(facet, facetConfig, filterContext, (int) matchCount)) {
 						log.debug("removing facet {} because of filter {}", facetConfig.getLabel(),
 								facetFilter.getClass().getSimpleName());
 						facetIterator.remove();
